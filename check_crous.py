@@ -1,235 +1,317 @@
 """
-CROUS Logement Alert Bot
-Checks trouverunlogement.lescrous.fr every 5 minutes via GitHub Actions
-and sends Telegram alerts when new rooms appear in Île-de-France.
+CROUS Logement Alert Bot — v2
 
-Updated version:
-- Uses CROUS tool 45 = "année prochaine 2026-2027"
-- Scrapes the public search page instead of the blocked /api/fr/search endpoint
-- Extracts accommodation links directly from the page HTML
+What this version does:
+- Uses CROUS tool 45, which matches the 2026-2027 search links.
+- Monitors only Paris, Saclay, and Orsay.
+- Scrapes the public CROUS pages instead of the blocked internal API.
+- Fetches each accommodation detail page when possible.
+- Sends Telegram alerts with price, surface, residence/name, city/zone, and demand flags like "Très demandé".
+- Supports manual reset through GitHub Actions input RESET_STATE=true.
 """
 
-import os
-import json
-import time
-import re
 import hashlib
-from urllib.parse import urljoin
+import html
+import json
+import os
+import re
+import time
 from datetime import datetime, timezone
+from typing import Dict, List, Set
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 
-BASE_URL = "https://trouverunlogement.lescrous.fr"
-TOOL_ID = "45"  # 45 = "Mon logement pour l'année prochaine 2026-2027"
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+CHAT_ID = os.environ["CHAT_ID"]
+
 STATE_FILE = "state.json"
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
+# Set to true only when you manually run the workflow and want alerts for every
+# currently available room again.
+RESET_STATE = os.environ.get("RESET_STATE", "false").lower() in {"1", "true", "yes", "y"}
 
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("Missing GitHub secret: TELEGRAM_TOKEN")
-if not CHAT_ID:
-    raise RuntimeError("Missing GitHub secret: CHAT_ID")
+# If you ever want to stop receiving rooms marked as very demanded, set this to True.
+# For now it is False, so you still receive them, but the message clearly warns you.
+SKIP_HIGH_DEMAND = False
 
-# Each zone uses the public CROUS search URL.
-# Bounds format: lon_min_lat_max_lon_max_lat_min
+TOOL_ID = "45"
+BASE_URL = "https://trouverunlogement.lescrous.fr"
+
+# Only the zones you asked to keep.
+# You can adjust the bounds later if you want a bigger/smaller area.
 ZONES = [
     {
         "name": "Paris",
-        "url": "https://trouverunlogement.lescrous.fr/tools/45/search"
-               "?bounds=2.224122_48.902156_2.4697602_48.8155755&locationName=Paris",
+        "url": (
+            f"{BASE_URL}/tools/{TOOL_ID}/search"
+            "?bounds=2.224122_48.902156_2.4697602_48.8155755"
+            "&locationName=Paris"
+        ),
     },
     {
-        "name": "Saclay / Gif-sur-Yvette / Orsay",
-        "url": "https://trouverunlogement.lescrous.fr/tools/45/search"
-               "?bounds=2.0900_48.7400_2.2500_48.6700&locationName=Orsay",
+        "name": "Saclay",
+        "url": (
+            f"{BASE_URL}/tools/{TOOL_ID}/search"
+            "?bounds=2.0900_48.7400_2.2500_48.6700"
+            "&locationName=Saclay"
+        ),
     },
     {
-        "name": "Palaiseau / Massy / Verrières",
-        "url": "https://trouverunlogement.lescrous.fr/tools/45/search"
-               "?bounds=2.1800_48.7300_2.3000_48.6800&locationName=Palaiseau",
-    },
-    {
-        "name": "Versailles / Saint-Quentin-en-Yvelines",
-        "url": "https://trouverunlogement.lescrous.fr/tools/45/search"
-               "?bounds=1.9500_48.8200_2.1500_48.7000&locationName=Versailles",
-    },
-    {
-        "name": "Créteil / Val-de-Marne",
-        "url": "https://trouverunlogement.lescrous.fr/tools/45/search"
-               "?bounds=2.3500_48.8000_2.5000_48.7400&locationName=Créteil",
-    },
-    {
-        "name": "Saint-Denis / Villetaneuse",
-        "url": "https://trouverunlogement.lescrous.fr/tools/45/search"
-               "?bounds=2.3000_48.9600_2.4500_48.9000&locationName=Saint-Denis",
-    },
-    {
-        "name": "Nanterre / La Défense",
-        "url": "https://trouverunlogement.lescrous.fr/tools/45/search"
-               "?bounds=2.1600_48.9200_2.2500_48.8700&locationName=Nanterre",
-    },
-    {
-        "name": "Évry / Courcouronnes",
-        "url": "https://trouverunlogement.lescrous.fr/tools/45/search"
-               "?bounds=2.3800_48.6500_2.5000_48.5800&locationName=Évry-Courcouronnes",
+        "name": "Orsay",
+        "url": (
+            f"{BASE_URL}/tools/{TOOL_ID}/search"
+            "?bounds=2.1400_48.7300_2.2200_48.6600"
+            "&locationName=Orsay"
+        ),
     },
 ]
 
 HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-    "User-Agent": "Mozilla/5.0 (compatible; CrousAlertBot/2.0; +https://github.com)",
-    "Referer": "https://trouverunlogement.lescrous.fr/",
+    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.7",
+    "User-Agent": "Mozilla/5.0 (compatible; CrousAlertBot/2.0)",
+    "Referer": BASE_URL + "/",
 }
 
 # ─── STATE ─────────────────────────────────────────────────────────────────────
 
-def now_utc() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+def load_state() -> Set[str]:
+    if RESET_STATE:
+        print("🔄 RESET_STATE=true → ignoring old state; all current rooms can alert again.")
+        return set()
 
-def load_state() -> set:
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return set(data.get("seen_ids", []))
         except Exception as e:
-            print(f"⚠️ Could not read state.json, starting empty: {e}")
+            print(f"⚠️ Could not read state.json: {e}")
+            return set()
+
     return set()
 
-def save_state(seen_ids: set):
+
+def save_state(seen_ids: Set[str]) -> None:
+    data = {
+        "seen_ids": sorted(seen_ids),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "tool_id": TOOL_ID,
+        "zones": [z["name"] for z in ZONES],
+    }
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(
-            {"seen_ids": sorted(seen_ids), "updated_at": now_utc()},
-            f,
-            indent=2,
-            ensure_ascii=False,
-        )
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-# ─── CROUS PAGE SCRAPER ────────────────────────────────────────────────────────
 
-def extract_result_count(text: str):
-    """
-    Extracts counts like:
-    - 12 logements trouvés pour Paris
-    - 1 logement trouvé pour ...
-    """
-    match = re.search(r"(\d+)\s+logements?\s+trouv", text, flags=re.IGNORECASE)
-    if match:
-        return int(match.group(1))
-    return None
+# ─── HELPERS ───────────────────────────────────────────────────────────────────
 
 def clean_text(value: str) -> str:
-    return re.sub(r"\s+", " ", value or "").strip()
+    value = html.unescape(value or "")
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
 
-def extract_price(text: str) -> str:
-    match = re.search(r"(?:de\s+)?\d+(?:[,.]\d+)?(?:\s*à\s*\d+(?:[,.]\d+)?)?\s*€", text)
-    return clean_text(match.group(0)) if match else ""
 
-def extract_surface(text: str) -> str:
-    match = re.search(r"(?:de\s+)?\d+(?:[,.]\d+)?(?:\s*à\s*\d+(?:[,.]\d+)?)?\s*m²", text, flags=re.IGNORECASE)
-    return clean_text(match.group(0)) if match else ""
+def stable_id_from_url(url: str) -> str:
+    # Use the accommodation slug/id when possible. Otherwise hash the URL.
+    m = re.search(r"/accommodations/([^/?#]+)", url)
+    if m:
+        return f"{TOOL_ID}:{m.group(1)}"
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
 
-def find_card_text(anchor) -> str:
-    """
-    Walks up the HTML tree until it finds a block that looks like a logement card.
-    """
-    node = anchor
-    best_text = clean_text(anchor.get_text(" ", strip=True))
 
-    for _ in range(8):
-        if not getattr(node, "parent", None):
-            break
-        node = node.parent
-        txt = clean_text(node.get_text(" ", strip=True))
+def extract_result_count(page_text: str):
+    m = re.search(r"(\d+)\s+logements?\s+trouv", page_text, flags=re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(\d+)\s+résultats?", page_text, flags=re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    return None
 
-        # A result card normally contains a price and/or m².
-        if "€" in txt or "m²" in txt:
-            best_text = txt
-            break
 
-        # Keep a reasonable text block if it grows.
-        if len(txt) > len(best_text) and len(txt) < 1200:
-            best_text = txt
+def extract_accommodation_links(html_text: str) -> List[str]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    links = set()
 
-    return best_text
-
-def fetch_rooms(zone: dict) -> list:
-    """
-    Fetch the public CROUS search page and extract accommodation results.
-    This avoids the old /api/fr/search endpoint, which now returns 405 Method Not Allowed.
-    """
-    try:
-        resp = requests.get(zone["url"], headers=HEADERS, timeout=25)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"  ⚠️ Page error for {zone['name']}: {e}")
-        return []
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    page_text = clean_text(soup.get_text(" ", strip=True))
-    count = extract_result_count(page_text)
-
-    print(f"   Page result count: {count if count is not None else 'unknown'}")
-
-    if count == 0 or "Aucun logement trouvé" in page_text:
-        return []
-
-    rooms = []
-    seen_links = set()
-
-    # Links look like /tools/45/accommodations/...
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if "/accommodations/" not in href:
+        if re.search(rf"/tools/{TOOL_ID}/accommodations/", href):
+            links.add(urljoin(BASE_URL, href))
+
+    # Regex fallback in case links are embedded in JSON/script sections.
+    for href in re.findall(r'["\']([^"\']*/tools/\d+/accommodations/[^"\']+)["\']', html_text):
+        if f"/tools/{TOOL_ID}/accommodations/" in href:
+            links.add(urljoin(BASE_URL, href))
+
+    return sorted(links)
+
+
+def page_has_high_demand(text: str) -> bool:
+    lowered = text.lower()
+    demand_phrases = [
+        "très demandé",
+        "très demandée",
+        "fortement demandé",
+        "forte demande",
+        "logement demandé",
+    ]
+    return any(phrase in lowered for phrase in demand_phrases)
+
+
+def extract_price(text: str) -> str:
+    # Examples: 350 €, 350.00 €, 350,00 €
+    matches = re.findall(r"(\d{2,4}(?:[,.]\d{1,2})?)\s*€", text)
+    if not matches:
+        return ""
+    # Choose the first plausible monthly price.
+    return matches[0].replace(".", ",")
+
+
+def extract_surface(text: str) -> str:
+    m = re.search(r"(\d{1,3}(?:[,.]\d{1,2})?)\s*m(?:²|2)\b", text, flags=re.IGNORECASE)
+    return m.group(1).replace(".", ",") if m else ""
+
+
+def extract_city(text: str, zone_name: str) -> str:
+    # Simple extraction fallback. Many CROUS pages put city in normal page text.
+    city_candidates = [
+        "Paris", "Orsay", "Saclay", "Gif-sur-Yvette", "Palaiseau", "Massy",
+        "Boulogne", "Montreuil", "Le Pré-Saint-Gervais", "Saint-Gervais",
+    ]
+    lowered = text.lower()
+    for city in city_candidates:
+        if city.lower() in lowered:
+            return city
+    return zone_name
+
+
+def extract_title_and_residence(soup: BeautifulSoup, text: str) -> Dict[str, str]:
+    title = ""
+    residence = ""
+
+    h1 = soup.find("h1")
+    if h1:
+        title = clean_text(h1.get_text(" "))
+
+    og_title = soup.find("meta", attrs={"property": "og:title"})
+    if not title and og_title and og_title.get("content"):
+        title = clean_text(og_title["content"])
+
+    # Look for common words around residence.
+    m = re.search(r"(?:Résidence|Residence)\s*:?\s*([A-ZÀ-Ÿ0-9][A-Za-zÀ-ÿ0-9 '\-–—]{3,80})", text)
+    if m:
+        residence = clean_text(m.group(1))
+
+    if not title:
+        title = "Logement CROUS disponible"
+
+    return {"title": title, "residence": residence}
+
+
+def fetch_detail(link: str, zone_name: str) -> Dict[str, str]:
+    room_id = stable_id_from_url(link)
+
+    room = {
+        "id": room_id,
+        "url": link,
+        "zone": zone_name,
+        "title": "Logement CROUS disponible",
+        "residence": "",
+        "city": zone_name,
+        "price": "",
+        "surface": "",
+        "high_demand": False,
+        "demand_label": "Non indiqué",
+    }
+
+    try:
+        resp = requests.get(link, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"  ⚠️ Detail page error for {link}: {e}")
+        return room
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    text = clean_text(soup.get_text(" "))
+
+    title_data = extract_title_and_residence(soup, text)
+    room["title"] = title_data["title"]
+    room["residence"] = title_data["residence"]
+    room["city"] = extract_city(text, zone_name)
+    room["price"] = extract_price(text)
+    room["surface"] = extract_surface(text)
+
+    high_demand = page_has_high_demand(text)
+    room["high_demand"] = high_demand
+    room["demand_label"] = "Très demandé" if high_demand else "Non indiqué"
+
+    return room
+
+
+# ─── CROUS SCRAPING ────────────────────────────────────────────────────────────
+
+def fetch_rooms(zone: Dict[str, str]) -> List[Dict[str, str]]:
+    """
+    Fetch public CROUS search page, extract accommodation links, then fetch each
+    detail page to enrich the alert with price/surface/demand info.
+    """
+    print(f"   URL: {zone['url']}")
+
+    try:
+        resp = requests.get(zone["url"], headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"  ⚠️ Search page error for {zone['name']}: {e}")
+        return []
+
+    page_text = clean_text(resp.text)
+    count = extract_result_count(page_text)
+    if count is not None:
+        print(f"   Page says: {count} logement(s) found")
+
+    if "Aucun logement trouvé" in page_text:
+        return []
+
+    links = extract_accommodation_links(resp.text)
+    print(f"   Found {len(links)} accommodation link(s) on page")
+
+    rooms: List[Dict[str, str]] = []
+
+    # Normal case: extract every detail page.
+    for link in links:
+        room = fetch_detail(link, zone["name"])
+        if SKIP_HIGH_DEMAND and room.get("high_demand"):
+            print(f"   ⏭ Skipping high-demand room: {room['id']}")
             continue
+        rooms.append(room)
+        time.sleep(0.3)
 
-        link = urljoin(BASE_URL, href)
-        if link in seen_links:
-            continue
-        seen_links.add(link)
-
-        id_match = re.search(r"/accommodations/([^/?#]+)", link)
-        room_id = id_match.group(1) if id_match else hashlib.sha1(link.encode()).hexdigest()[:16]
-
-        title = clean_text(a.get_text(" ", strip=True)) or "Logement CROUS disponible"
-        card_text = find_card_text(a)
-        price = extract_price(card_text)
-        surface = extract_surface(card_text)
-
-        rooms.append({
-            "id": room_id,
-            "title": title,
-            "price": price,
-            "surface": surface,
-            "city": zone["name"],
-            "url": link,
-            "details": card_text[:500],
-        })
-
-    # Fallback: sometimes the page shows the number but links are not extracted.
-    # In that case, alert once with the search URL.
+    # Fallback: CROUS page says rooms exist but links were not captured.
     if not rooms and count and count > 0:
-        fallback_id = "search-" + hashlib.sha1(f"{zone['url']}:{count}".encode()).hexdigest()[:16]
+        fallback_id = hashlib.sha256((zone["url"] + str(count)).encode("utf-8")).hexdigest()[:16]
         rooms.append({
-            "id": fallback_id,
-            "title": f"{count} logements CROUS trouvés",
+            "id": f"fallback:{TOOL_ID}:{fallback_id}",
+            "url": zone["url"],
+            "zone": zone["name"],
+            "title": f"{count} logement(s) CROUS disponible(s)",
+            "residence": "",
+            "city": zone["name"],
             "price": "",
             "surface": "",
-            "city": zone["name"],
-            "url": zone["url"],
-            "details": f"{count} logements trouvés sur la page de recherche.",
+            "high_demand": False,
+            "demand_label": "Non indiqué",
         })
 
     return rooms
 
+
 # ─── TELEGRAM ──────────────────────────────────────────────────────────────────
 
-def send_telegram(message: str):
+def send_telegram(message: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
@@ -239,49 +321,68 @@ def send_telegram(message: str):
     }
 
     try:
-        r = requests.post(url, json=payload, timeout=15)
+        r = requests.post(url, json=payload, timeout=10)
         r.raise_for_status()
         print("   ✅ Telegram sent OK")
     except Exception as e:
         print(f"   ❌ Telegram error: {e}")
 
-def format_room_message(room: dict, zone_name: str) -> str:
-    title = room.get("title") or "Logement CROUS disponible"
-    price = room.get("price") or ""
-    surface = room.get("surface") or ""
-    city = room.get("city") or zone_name
-    link = room.get("url") or f"https://trouverunlogement.lescrous.fr/tools/{TOOL_ID}/search"
+
+def format_room_message(room: Dict[str, str], zone_name: str) -> str:
+    title = clean_text(room.get("title") or "Logement CROUS disponible")
+    residence = clean_text(room.get("residence") or "")
+    city = clean_text(room.get("city") or zone_name)
+    price = clean_text(room.get("price") or "")
+    surface = clean_text(room.get("surface") or "")
+    demand_label = clean_text(room.get("demand_label") or "Non indiqué")
+    link = room.get("url") or zone_name
 
     lines = [
         "🏠 <b>Nouveau logement CROUS disponible !</b>",
-        f"📍 <b>Zone :</b> {zone_name}",
-        f"📋 <b>Résidence / logement :</b> {title}",
+        f"📍 <b>Zone :</b> {html.escape(zone_name)}",
     ]
 
-    if price:
-        lines.append(f"💶 <b>Loyer :</b> {price}")
-    if surface:
-        lines.append(f"📐 <b>Surface :</b> {surface}")
-    if city:
-        lines.append(f"🌆 <b>Ville :</b> {city}")
+    if residence:
+        lines.append(f"🏢 <b>Résidence :</b> {html.escape(residence)}")
 
-    lines.append(f"\n👉 <a href=\"{link}\">Voir le logement</a>")
+    lines.append(f"📋 <b>Logement :</b> {html.escape(title)}")
+
+    if price:
+        lines.append(f"💶 <b>Loyer :</b> {html.escape(price)} €/mois")
+    else:
+        lines.append("💶 <b>Loyer :</b> Non indiqué")
+
+    if surface:
+        lines.append(f"📐 <b>Surface :</b> {html.escape(surface)} m²")
+
+    if city:
+        lines.append(f"🌆 <b>Ville :</b> {html.escape(city)}")
+
+    if room.get("high_demand"):
+        lines.append("🔥 <b>Demande :</b> Très demandé — candidate rapidement")
+    else:
+        lines.append(f"🔥 <b>Demande :</b> {html.escape(demand_label)}")
+
+    lines.append(f"\n👉 <a href='{html.escape(link, quote=True)}'>Voir le logement</a>")
+
     return "\n".join(lines)
+
 
 # ─── MAIN ──────────────────────────────────────────────────────────────────────
 
-def main():
-    print(f"🕐 CROUS check started at {now_utc()}")
-    print(f"🔧 Using CROUS tool ID: {TOOL_ID}")
+def main() -> None:
+    print(f"🕐 CROUS check started at {datetime.now(timezone.utc).isoformat()}")
+    print(f"Using CROUS tool ID: {TOOL_ID}")
+    print(f"Zones monitored: {', '.join(z['name'] for z in ZONES)}")
 
     seen_ids = load_state()
     new_rooms_found = 0
-    all_current_ids = set()
+    all_current_ids: Set[str] = set()
 
     for zone in ZONES:
         print(f"\n🔍 Checking: {zone['name']}")
         rooms = fetch_rooms(zone)
-        print(f"   → {len(rooms)} room(s) extracted from page")
+        print(f"   → {len(rooms)} room(s) extracted")
 
         for room in rooms:
             room_id = str(room.get("id", "")).strip()
@@ -291,7 +392,10 @@ def main():
             all_current_ids.add(room_id)
 
             if room_id not in seen_ids:
-                print(f"   🆕 NEW room found: {room_id} — {room.get('title', '')}")
+                print(f"   🆕 NEW room found: {room_id}")
+                print(f"      Title: {room.get('title', '')}")
+                print(f"      Price: {room.get('price') or 'not indicated'}")
+                print(f"      Demand: {room.get('demand_label')}")
                 msg = format_room_message(room, zone["name"])
                 send_telegram(msg)
                 new_rooms_found += 1
@@ -299,14 +403,15 @@ def main():
 
         time.sleep(1)
 
-    print(f"\n📊 Summary: {new_rooms_found} new room(s) found and notified")
-
     updated_ids = seen_ids | all_current_ids
     save_state(updated_ids)
+
+    print(f"\n📊 Summary: {new_rooms_found} new room(s) found and notified")
     print(f"💾 State saved: {len(updated_ids)} total known IDs")
 
     if new_rooms_found == 0:
         print("✅ No new rooms — no Telegram message sent")
+
 
 if __name__ == "__main__":
     main()

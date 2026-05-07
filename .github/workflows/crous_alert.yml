@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
+    inputs:
+      reset_state:
+        description: "Reset state and alert again for all currently available rooms?"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
   push:
     branches: ["main"]
 
@@ -25,6 +34,12 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Reset state if requested
+        if: ${{ github.event.inputs.reset_state == 'true' }}
+        run: |
+          echo '{"seen_ids": [], "updated_at": "2025-01-01T00:00:00"}' > state.json
+          echo "State reset requested."
 
       - name: Run CROUS scraper
         run: python check_crous.py
